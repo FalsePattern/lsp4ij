@@ -13,6 +13,7 @@ fun prop(name: String): String {
 
 plugins {
     java // Java support
+    `maven-publish`
     alias(libs.plugins.kotlin) // Kotlin support
     alias(libs.plugins.gradleIntelliJPlugin) // Gradle IntelliJ Plugin
     alias(libs.plugins.changelog) // Gradle Changelog Plugin
@@ -135,6 +136,33 @@ configurations {
     }
 }
 
+java {
+    withSourcesJar()
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("mavenJava") {
+            artifactId = project.name
+            from(components["java"])
+            versionMapping {
+                usage("java-api") {
+                    fromResolutionOf("runtimeClasspath")
+                }
+                usage("java-runtime") {
+                    fromResolutionResult()
+                }
+            }
+        }
+    }
+    repositories {
+        maven {
+            url = uri("https://mvn.falsepattern.com/releases/")
+            name = "mavenpattern"
+            credentials(PasswordCredentials::class)
+        }
+    }
+}
 testlogger {
     theme = ThemeType.STANDARD
     showExceptions = true
