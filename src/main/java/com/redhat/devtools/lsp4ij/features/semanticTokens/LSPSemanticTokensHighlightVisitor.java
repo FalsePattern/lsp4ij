@@ -11,9 +11,15 @@
  ******************************************************************************/
 package com.redhat.devtools.lsp4ij.features.semanticTokens;
 
+import com.intellij.codeInsight.daemon.DaemonCodeAnalyzer;
 import com.intellij.codeInsight.daemon.impl.HighlightVisitor;
 import com.intellij.codeInsight.daemon.impl.analysis.HighlightInfoHolder;
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.fileEditor.FileEditorManager;
+import com.intellij.openapi.fileEditor.TextEditor;
 import com.intellij.openapi.progress.ProcessCanceledException;
+import com.intellij.openapi.progress.ProgressManager;
+import com.intellij.psi.PsiDocumentManager;
 import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiFile;
 import com.intellij.psi.impl.source.tree.LeafElement;
@@ -33,6 +39,10 @@ import org.slf4j.LoggerFactory;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static com.redhat.devtools.lsp4ij.internal.CompletableFutures.isDoneNormally;
 import static com.redhat.devtools.lsp4ij.internal.CompletableFutures.waitUntilDone;
@@ -60,25 +70,38 @@ public class LSPSemanticTokensHighlightVisitor implements HighlightVisitor {
 
     private HighlightInfoHolder holder;
     private LazyHighlightInfo[] lazyInfos;
+    private AtomicInteger maxOffset;
+    private ReentrantLock lock;
 
     @Override
     public boolean analyze(@NotNull PsiFile file, boolean updateWholeFile, @NotNull HighlightInfoHolder holder, @NotNull Runnable action) {
         if (ProjectIndexingManager.canExecuteLSPFeature(file) != ExecuteLSPFeatureStatus.NOW) {
             return true;
         }
+        AtomicBoolean isCancelled = new AtomicBoolean(false);
+        CompletableFuture<?> future = null;
         try {
-            if (SimpleLanguageUtils.isSupported(file.getLanguage())) {
-                highlightSemanticTokens(file, holder);
-                this.lazyInfos = null;
-                this.holder = null;
-            } else {
-                this.lazyInfos = highlightSemanticTokens(file, null);
+            var lock = new ReentrantLock();
+            future = highlightSemanticTokens(file, isCancelled, lock);
+            if (future != null) {
+                this.lock = lock;
+                this.maxOffset = new AtomicInteger(0);
                 this.holder = holder;
+            } else {
+                this.lazyInfos = null;
             }
             action.run();
         } finally {
+            isCancelled.set(true);
             this.holder = null;
             this.lazyInfos = null;
+            this.maxOffset = null;
+            try {
+                if (future != null) {
+                future.get();
+                }
+            } catch (InterruptedException | ExecutionException ignored) {
+            }
         }
         return true;
     }
@@ -91,22 +114,41 @@ public class LSPSemanticTokensHighlightVisitor implements HighlightVisitor {
         if (start < 0)
             return;
         int end = start + element.getTextLength();
-        for (int i = start; i < end && i < lazyInfos.length; i++) {
-            var info = lazyInfos[i];
-            if (info != null) {
-                holder.add(info.resolve(i));
-                lazyInfos[i] = null;
+        while (!lock.tryLock()) {
+            Thread.yield();
+        }
+        while (end > maxOffset.get()) {
+            lock.unlock();
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
             }
+            while (!lock.tryLock()) {
+                Thread.yield();
+            }
+        }
+        try {
+            for (int i = start; i < end && i < lazyInfos.length; i++) {
+                var info = lazyInfos[i];
+                if (info != null) {
+                    holder.add(info.resolve(i));
+                    lazyInfos[i] = null;
+                }
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
-    private static LazyHighlightInfo[] highlightSemanticTokens(@NotNull PsiFile file, @Nullable HighlightInfoHolder holder) {
+    private CompletableFuture<?> highlightSemanticTokens(@NotNull PsiFile file, AtomicBoolean isCancelled, ReentrantLock lock) {
         // Consume LSP 'textDocument/semanticTokens/full' request
         LSPSemanticTokensSupport semanticTokensSupport = LSPFileSupport.getSupport(file).getSemanticTokensSupport();
         var params = new SemanticTokensParams(LSPIJUtils.toTextDocumentIdentifier(file.getVirtualFile()));
         CompletableFuture<SemanticTokensData> semanticTokensFuture = semanticTokensSupport.getSemanticTokens(params);
+
         try {
-            waitUntilDone(semanticTokensFuture, file);
+            waitUntilDone(semanticTokensFuture, file, 25);
         } catch (
                 ProcessCanceledException e) {//Since 2024.2 ProcessCanceledException extends CancellationException so we can't use multicatch to keep backward compatibility
             //TODO delete block when minimum required version is 2024.2
@@ -119,6 +161,15 @@ public class LSPSemanticTokensHighlightVisitor implements HighlightVisitor {
         } catch (ExecutionException e) {
             LOGGER.error("Error while consuming LSP 'textDocument/semanticTokens/full' request", e);
             return null;
+        } catch (TimeoutException e) {
+            semanticTokensFuture.thenRun(() -> {
+                var project = file.getProject();
+                if (project.isDisposed()) {
+                    return;
+                }
+                DaemonCodeAnalyzer.getInstance(project).restart(file);
+            });
+            return null;
         }
 
         if (isDoneNormally(semanticTokensFuture)) {
@@ -129,16 +180,31 @@ public class LSPSemanticTokensHighlightVisitor implements HighlightVisitor {
                 if (document == null) {
                     return null;
                 }
-                if (holder != null) {
-                    semanticTokens.highlight(file, document, (start, end, colorKey) ->
-                            holder.add(LazyHighlightInfo.resolve(start, end, colorKey)));
-                    return null;
-                } else {
-                    var infos = new LazyHighlightInfo[document.getTextLength()];
-                    semanticTokens.highlight(file, document, (start, end, colorKey) ->
-                            infos[start] = new LazyHighlightInfo(end, colorKey));
-                    return infos;
-                }
+                var infos = new LazyHighlightInfo[document.getTextLength()];
+                this.lazyInfos = infos;
+                return CompletableFuture.runAsync(() -> {
+                    semanticTokens.highlight(file, document, (start, end, colorKey) -> {
+                        var offsetAtomic = maxOffset;
+                        if (offsetAtomic == null) {
+                            return;
+                        }
+                        lock.lock();
+                        try {
+                            infos[start] = new LazyHighlightInfo(end, colorKey);
+                            offsetAtomic.set(start + end);
+                        } finally {
+                            lock.unlock();
+                        }
+                        }, () -> {
+                        if (isCancelled.get()) {
+                            throw new ProcessCanceledException();
+                        }
+                    });
+                    var offsetAtomic = maxOffset;
+                    if (offsetAtomic != null) {
+                        offsetAtomic.set(Integer.MAX_VALUE);
+                    }
+                });
             }
         }
         return null;

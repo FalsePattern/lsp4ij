@@ -61,7 +61,8 @@ public class SemanticTokensData {
     @Nullable
     public void highlight(@NotNull PsiFile file,
                           @NotNull Document document,
-                          @NotNull LazyHighlightInfo.Consumer addInfo) {
+                          @NotNull LazyHighlightInfo.Consumer addInfo,
+                          @NotNull Runnable checkCanceled) {
         var inspector = SemanticTokensInspectorManager.getInstance(file.getProject());
         boolean notifyInspector = inspector.hasSemanticTokensInspectorListener();
         List<SemanticTokensHighlightInfo> highlightInfos = notifyInspector ? new ArrayList<>() : null;
@@ -84,7 +85,7 @@ public class SemanticTokensData {
                 cancelCounter++;
                 if (cancelCounter >= 100) {
                     cancelCounter = 0;
-                    ProgressManager.checkCanceled();
+                    checkCanceled.run();
                 }
 
                 switch (idx % 5) {
